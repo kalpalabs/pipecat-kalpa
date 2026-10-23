@@ -621,6 +621,8 @@ class KalpaTTSService(WebsocketTTSService):
                 if u.context_id != failed.context_id:
                     resend.setdefault(u.context_id, []).append(u.text)
         self._held = {**resend, **self._held}
+        # The next send replaces this connection; its close must not also reconnect.
+        await super()._disconnect()
         self._websocket = None
         self._quick_failure_tracker.reset()
         await self._forget_connection()

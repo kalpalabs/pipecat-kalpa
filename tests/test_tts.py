@@ -420,6 +420,58 @@ async def test_kalpa_tts_reply_that_fails_before_its_flush_replaces_the_connecti
 
 
 @pytest.mark.asyncio
+async def test_kalpa_tts_fatal_reply_reconnects_only_when_more_text_arrives(monkeypatch):
+    """A failed reply's close cannot start a competing automatic reconnect."""
+    fake = _FakeKalpa(fail_first_open={"type": "inference_error", "message": "Failed."})
+    close_handled = asyncio.Event()
+    connections_before_retry = []
+
+    async with serve(fake.handler, "127.0.0.1", 0) as server:
+        host, port = next(iter(server.sockets)).getsockname()[:2]
+        tts = KalpaTTSService(api_key="test-key", base_url=f"ws://{host}:{port}")
+        maybe_reconnect = tts._maybe_try_reconnect
+        send = tts._send
+
+        async def handle_close(*args, **kwargs):
+            result = await maybe_reconnect(*args, **kwargs)
+            close_handled.set()
+            return result
+
+        async def send_after_close(text, context_id):
+            if text == "Next reply.":
+                await asyncio.wait_for(close_handled.wait(), timeout=1)
+                connections_before_retry.append(len(fake.connections))
+            await send(text, context_id)
+
+        monkeypatch.setattr(tts, "_maybe_try_reconnect", handle_close)
+        monkeypatch.setattr(tts, "_send", send_after_close)
+        down, up = await asyncio.wait_for(
+            run_test(
+                tts,
+                frames_to_send=[
+                    LLMFullResponseStartFrame(),
+                    LLMTextFrame("First part."),
+                    SleepFrame(sleep=0.05),
+                    LLMTextFrame(" Second part."),
+                    LLMFullResponseEndFrame(),
+                    *_reply("Next reply."),
+                    SleepFrame(sleep=0.3),
+                ],
+            ),
+            timeout=5,
+        )
+
+    assert connections_before_retry == [1]
+    assert tts.is_usable and len(fake.connections) == 2
+    assert [e.category for e in _errors(down + up)] == [ErrorCategory.SERVER]
+    assert _audio_of(down) == AUDIO_1 + _pcm(1)
+    assert [m.get("text") for m in fake.connections[1] if m["type"] == "sendText"] == [
+        "Next reply.",
+        None,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_kalpa_tts_reply_that_goes_quiet_does_not_hold_later_speech():
     """A reply whose context times out before the reply ends is ended then.
 
