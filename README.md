@@ -8,6 +8,12 @@ and `KalpaHttpTTSService` for HTTP streaming. See the
 [Kalpa speech documentation](https://docs.kalpalabs.ai/text-to-speech) for
 available voices, models, and languages.
 
+## Demo
+
+[Watch the Pipecat + Kalpa TTS 1 demo](https://github.com/kalpalabs/pipecat-kalpa/releases/download/v0.1.0/kalpa-pipecat-live-demo.mp4).
+The browser conversation includes English and Hindi speech, a spoken
+interruption, and timestamped Pipecat events.
+
 ## Installation
 
 Requires Python 3.11 or later and Pipecat 1.13.x.
