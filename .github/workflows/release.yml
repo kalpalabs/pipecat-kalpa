@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Release tag, or main for a TestPyPI rehearsal"
+        required: true
+        default: main
+        type: string
+      repository:
+        description: "Package index"
+        required: true
+        default: testpypi
+        type: choice
+        options: [testpypi, pypi]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.repository || 'pypi' }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Verify release source and version
+        env:
+          SOURCE_REF: ${{ inputs.ref || github.ref }}
+          PUBLISH_INDEX: ${{ inputs.repository || 'pypi' }}
+        run: |
+          git merge-base --is-ancestor HEAD origin/main
+          uv run --no-project python - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          version = project["version"]
+          if os.environ["PUBLISH_INDEX"] == "pypi":
+              expected = {f"v{version}", f"refs/tags/v{version}"}
+              if os.environ["SOURCE_REF"] not in expected:
+                  raise SystemExit(f"PyPI releases require the v{version} tag")
+              tag_commit = subprocess.check_output(
+                  ["git", "rev-parse", f"refs/tags/v{version}^{{commit}}"], text=True
+              ).strip()
+              head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if head != tag_commit:
+                  raise SystemExit("The checked-out source does not match the release tag")
+          print(f"Building {project['name']} {version} from {os.environ['SOURCE_REF']}")
+          PY
+      - run: uv sync --locked
+      - run: uv run pytest
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv build
+      - run: uvx --from twine twine check --strict dist/*
+      - run: uv venv .wheel-venv
+      - run: uv pip install --python .wheel-venv/bin/python dist/*.whl
+      - run: .wheel-venv/bin/python -c "from pipecat_kalpa import KalpaTTSService, KalpaHttpTTSService"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish-testpypi:
+    if: github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/pipecat-kalpa/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    if: github.event_name == 'push' || inputs.repository == 'pypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pipecat-kalpa/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

@@ -20,7 +20,7 @@ Requires Python 3.11 or later and Pipecat 1.13.x.
 Automated compatibility tests pass with Pipecat 1.13.0 on Python 3.12.
 
 ```bash
-uv add "pipecat-kalpa @ git+https://github.com/kalpalabs/pipecat-kalpa.git@v0.1.0"
+uv add pipecat-kalpa
 ```
 
 ## Usage
@@ -138,4 +138,4 @@ the [integration repository](https://github.com/kalpalabs/pipecat-kalpa/issues).
 
 ## License
 
-BSD-2-Clause. See [LICENSE](LICENSE).
+BSD-2-Clause. See [LICENSE](https://github.com/kalpalabs/pipecat-kalpa/blob/main/LICENSE).
