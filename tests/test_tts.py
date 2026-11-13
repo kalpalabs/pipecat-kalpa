@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import time
+from importlib.metadata import version
 
 import pytest
 import websockets
@@ -27,7 +28,11 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
     TTSUpdateSettingsFrame,
 )
+from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.services.tts_service import TextAggregationMode
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.utils.errors import ErrorCategory
 from websockets.asyncio.server import serve
@@ -242,6 +247,56 @@ async def _run_ws(fake: _FakeKalpa, frames: list, pipeline_params=None, **kwargs
             run_test(tts, frames_to_send=frames, pipeline_params=pipeline_params), timeout=10
         )
     return tts, down, up
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [TextAggregationMode.TOKEN, TextAggregationMode.SENTENCE])
+@pytest.mark.parametrize("pause", [0.0, 0.75], ids=["continuous", "past-audio-timeout"])
+async def test_kalpa_tts_completed_sentence_reaches_conversation_history(mode, pause):
+    fake = _FakeKalpa()
+    context = LLMContext()
+    async with serve(fake.handler, "127.0.0.1", 0) as server:
+        host, port = next(iter(server.sockets)).getsockname()[:2]
+        tts = KalpaTTSService(
+            api_key="test-key",
+            base_url=f"ws://{host}:{port}",
+            text_aggregation_mode=mode,
+            stop_frame_timeout_s=0.5,
+        )
+        pipeline = Pipeline([tts, LLMContextAggregatorPair(context).assistant()])
+        down, _ = await asyncio.wait_for(
+            run_test(
+                pipeline,
+                frames_to_send=[
+                    LLMFullResponseStartFrame(),
+                    LLMTextFrame("Let me check that."),
+                    LLMTextFrame(" One"),
+                    SleepFrame(sleep=pause),
+                    LLMTextFrame(" moment."),
+                    LLMFullResponseEndFrame(),
+                    SleepFrame(sleep=1.0),
+                ],
+            ),
+            timeout=10,
+        )
+
+    assert _audio_of(down) == _pcm(1) + (_pcm(2) if pause else b"")
+    messages = context.get_messages()
+    assert len(messages) == 1
+    spoken = " ".join(messages[0]["content"].split())
+    # Text sent before a context times out without audio is missing from history: the
+    # unfinished sentence in token mode, and on 1.16.0 everything sent before the pause.
+    # Match only these known outcomes; any other history, or a newer release, fails CI.
+    pipecat = version("pipecat-ai")
+    if pipecat == "1.16.0":
+        lost = {TextAggregationMode.TOKEN: "moment.", TextAggregationMode.SENTENCE: "One moment."}
+    elif pipecat.startswith(("1.13.", "1.14.", "1.15.")):
+        lost = {TextAggregationMode.TOKEN: "Let me check that. moment."}
+    else:
+        lost = {}
+    if pause and spoken == lost.get(mode):
+        pytest.xfail(f"Pipecat {pipecat} drops text sent before the context timed out")
+    assert spoken == "Let me check that. One moment."
 
 
 @pytest.mark.asyncio
