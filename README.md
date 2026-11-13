@@ -16,12 +16,22 @@ interruption, and timestamped Pipecat events.
 
 ## Installation
 
-Requires Python 3.11 or later and Pipecat 1.13.x.
-Automated compatibility tests pass with Pipecat 1.13.0 on Python 3.12.
+Requires Python 3.11 or later and Pipecat 1.13 or later (below 2.0).
+Tested with Pipecat 1.13.0 through 1.16.0.
 
 ```bash
 uv add pipecat-kalpa
 ```
+
+### Known limitation
+
+If text generation pauses mid-reply for longer than `stop_frame_timeout_s`
+(15 seconds by default) before Kalpa returns the reply's first audio, the
+audio still plays in full, but text sent before the pause can be missing from
+the assistant's conversation history. With the default token aggregation, the
+unfinished sentence at the pause is missing on every supported Pipecat
+version. With Pipecat 1.16.0, everything sent before the pause is missing, in
+either aggregation mode. Tests track this case in both modes.
 
 ## Usage
 
