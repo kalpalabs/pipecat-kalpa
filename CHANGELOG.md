@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.3
+
+- Fix: when text generation paused mid-reply for longer than
+  `stop_frame_timeout_s` (15 seconds by default) before Kalpa returned the
+  reply's first audio, text sent before the pause was missing from the
+  conversation history. A reply now stays open while its text pauses, for up
+  to 45 seconds in all, and plays as one response. Speech queued behind a
+  paused reply waits for it.
+- Tested with Pipecat 1.17.
+
 ## 0.1.2
 
 - Support Pipecat 1.13 through 1.x. Installing the package no longer

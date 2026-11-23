@@ -14,6 +14,7 @@ See https://docs.kalpalabs.ai/text-to-speech for the streaming WebSocket
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,10 @@ _KEEPALIVE_INTERVAL_SECONDS = 60.0
 # Completed replies end with `responseDone`; a fatal error before flush closes the socket.
 # The audio-context idle timeout is an additional safety net.
 _STOP_FRAME_TIMEOUT_SECONDS = 15.0
+
+# A reply whose text pauses is kept open for at most this long, the stop frame timeout included,
+# then flushed.
+_PAUSED_REPLY_LIMIT_SECONDS = 45.0
 
 # A cancel Kalpa doesn't acknowledge in time leaves the connection unusable.
 _CANCEL_ACK_TIMEOUT_SECONDS = 1.0
@@ -121,6 +126,7 @@ class _Utterance:
     # Named by `responseCreated`, which Kalpa sends for utterances in the order they arrived.
     response_id: str | None = None
     has_audio: bool = False
+    last_text_at: float = 0.0
 
 
 class KalpaTTSService(WebsocketTTSService):
@@ -208,6 +214,8 @@ class KalpaTTSService(WebsocketTTSService):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._receive_task = None
+        self._reply_keepalive_task = None
+        self._stopping = False
 
         # Per-connection state. Only the last utterance can still take text.
         self._utterances: list[_Utterance] = []
@@ -241,6 +249,11 @@ class KalpaTTSService(WebsocketTTSService):
         await super().setup(setup)
         await self._connect()
 
+    async def stop(self, frame: EndFrame):
+        """Stop keeping a reply open; the base class waits for playback before it ends the reply."""
+        self._stopping = True
+        await super().stop(frame)
+
     async def _connect(self):
         await super()._connect()
 
@@ -252,6 +265,9 @@ class KalpaTTSService(WebsocketTTSService):
         if self._websocket:
             self._create_keepalive_task(interval=_KEEPALIVE_INTERVAL_SECONDS)
 
+        if not self._reply_keepalive_task:
+            self._reply_keepalive_task = self.create_task(self._keep_reply_context_alive())
+
     async def _disconnect(self):
         await super()._disconnect()
 
@@ -260,6 +276,10 @@ class KalpaTTSService(WebsocketTTSService):
             self._receive_task = None
 
         await self._cancel_keepalive_task()
+
+        if self._reply_keepalive_task:
+            await self.cancel_task(self._reply_keepalive_task)
+            self._reply_keepalive_task = None
 
         await self._disconnect_websocket()
 
@@ -393,6 +413,26 @@ class KalpaTTSService(WebsocketTTSService):
         """Send an empty text message as an application-level heartbeat."""
         await self._get_websocket().send(json.dumps({"type": "sendText", "text": ""}))
 
+    async def _keep_reply_context_alive(self):
+        """Keep the base class from timing out a reply while its text is still arriving.
+
+        Kalpa starts audio once enough text arrives or on a flush, so a pause in the LLM's text
+        before the reply ends is not Kalpa going quiet. Timing the reply out there would drop the
+        text already sent from the conversation history.
+        """
+        while True:
+            await asyncio.sleep(self._stop_frame_timeout_s / 3)
+            utterance = self._open_utterance()
+            # Only a reply in progress that the base class will still end, for a bounded time.
+            if (
+                utterance
+                and utterance.context_id == self._turn_context_id
+                and not self._stopping
+                and time.monotonic() - utterance.last_text_at
+                < _PAUSED_REPLY_LIMIT_SECONDS - self._stop_frame_timeout_s
+            ):
+                self._refresh_audio_context(utterance.context_id)
+
     def _open_utterance(self) -> _Utterance | None:
         if self._utterances and not self._utterances[-1].flushed:
             return self._utterances[-1]
@@ -420,6 +460,7 @@ class KalpaTTSService(WebsocketTTSService):
                 utterance = _Utterance(context_id)
                 self._utterances.append(utterance)
             utterance.text += piece
+            utterance.last_text_at = time.monotonic()
             await self._get_websocket().send(json.dumps({"type": "sendText", "text": piece}))
 
     async def _send_held(self):
