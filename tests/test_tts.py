@@ -10,7 +10,6 @@ import asyncio
 import base64
 import json
 import time
-from importlib.metadata import version
 
 import pytest
 import websockets
@@ -22,6 +21,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    TextFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
@@ -280,23 +280,62 @@ async def test_kalpa_tts_completed_sentence_reaches_conversation_history(mode, p
             timeout=10,
         )
 
-    assert _audio_of(down) == _pcm(1) + (_pcm(2) if pause else b"")
     messages = context.get_messages()
     assert len(messages) == 1
     spoken = " ".join(messages[0]["content"].split())
-    # Text sent before a context times out without audio is missing from history: the
-    # unfinished sentence in token mode, and on 1.16.0 everything sent before the pause.
-    # Match only these known outcomes; any other history, or a newer release, fails CI.
-    pipecat = version("pipecat-ai")
-    if pipecat == "1.16.0":
-        lost = {TextAggregationMode.TOKEN: "moment.", TextAggregationMode.SENTENCE: "One moment."}
-    elif pipecat.startswith(("1.13.", "1.14.", "1.15.")):
-        lost = {TextAggregationMode.TOKEN: "Let me check that. moment."}
-    else:
-        lost = {}
-    if pause and spoken == lost.get(mode):
-        pytest.xfail(f"Pipecat {pipecat} drops text sent before the context timed out")
     assert spoken == "Let me check that. One moment."
+    assert _audio_of(down) == _pcm(1)  # one response, though the LLM paused
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_reply_paused_past_the_limit_is_ended(monkeypatch):
+    """A reply whose text pauses past the limit is flushed then."""
+    monkeypatch.setattr("pipecat_kalpa.tts._PAUSED_REPLY_LIMIT_SECONDS", 0.7)
+    fake = _FakeKalpa()
+    _, down, _ = await _run_ws(
+        fake,
+        [
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Let me check."),
+            SleepFrame(sleep=1.5),  # past the limit, 0.2 s kept open plus the 0.5 s timeout
+            LLMTextFrame(" Done."),
+            LLMFullResponseEndFrame(),
+            SleepFrame(sleep=0.5),
+        ],
+        stop_frame_timeout_s=0.5,
+    )
+
+    sends = ["flush" if m.get("flush") else m["text"] for m in fake.of_type("sendText")]
+    assert sends == ["Let me check.", "flush", " Done.", "flush"]
+    assert _audio_of(down) == _pcm(1) + _pcm(2)
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_text_outside_a_reply_does_not_hold_later_speech():
+    """Only a reply is kept open in a pause: nothing else would end the text, so later speech
+    would wait behind it."""
+    fake = _FakeKalpa()
+    await _run_ws(
+        fake,
+        [TextFrame("Hello there."), SleepFrame(sleep=1.0), TTSSpeakFrame("Hi."), SleepFrame(0.5)],
+        stop_frame_timeout_s=0.5,
+    )
+
+    sends = ["flush" if m.get("flush") else m["text"] for m in fake.of_type("sendText")]
+    assert sends == ["Hello there.", "flush", "Hi.", "flush"]
+
+
+@pytest.mark.asyncio
+async def test_kalpa_tts_ends_while_a_reply_is_paused():
+    """An EndFrame mid-reply still ends the pipeline, though the reply is kept open in a pause.
+
+    The base class waits for playback to end before it ends the reply.
+    """
+    await _run_ws(
+        _FakeKalpa(),
+        [LLMFullResponseStartFrame(), LLMTextFrame("Let me check that."), SleepFrame(sleep=1.0)],
+        stop_frame_timeout_s=0.5,
+    )
 
 
 @pytest.mark.asyncio
@@ -698,22 +737,32 @@ async def test_kalpa_tts_failed_reply_keeps_the_service_usable():
 
 @pytest.mark.asyncio
 async def test_kalpa_tts_voice_change_reconnects_with_the_new_voice():
-    """The voice rides the URL, so a voice update opens a new connection for it."""
+    """The voice rides the URL, so a voice update opens a new connection for it.
+
+    A reply on the new connection is still kept open while its text pauses.
+    """
     fake = _FakeKalpa()
     await _run_ws(
         fake,
         [
             TTSUpdateSettingsFrame(delta=KalpaTTSService.Settings(voice=OTHER_VOICE_ID)),
             SleepFrame(sleep=0.2),
-            *_reply("Hello."),
+            LLMFullResponseStartFrame(),
+            LLMTextFrame("Hello"),
+            SleepFrame(sleep=0.75),  # past the stop frame timeout
+            LLMTextFrame(" there."),
+            LLMFullResponseEndFrame(),
             SleepFrame(sleep=0.3),
         ],
+        stop_frame_timeout_s=0.5,
     )
 
     assert fake.paths == [
         f"/v1/tts/{DEFAULT_VOICE_ID}/stream",
         f"/v1/tts/{OTHER_VOICE_ID}/stream",
     ]
+    sends = ["flush" if m.get("flush") else m["text"] for m in fake.of_type("sendText")]
+    assert sends == ["Hello", " there.", "flush"]
 
 
 async def _run_http(aiohttp_client, handler, **kwargs):
